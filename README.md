@@ -87,12 +87,25 @@ This repository showcases practical applications of quantitative finance techniq
     - Weekly sentiment aggregation
     - Correlation with BTC-USD weekly price changes
     - Time series visualization of sentiment trends vs. price movements
+  
+  - **Statistical Robustness**:
+    - Bootstrap confidence intervals (95% CI) for weekly sentiment
+    - Article length weighting (by n_pieces)
+    - Outlet dominance diagnostics (flags weeks with >40% single-outlet concentration)
+    - Time-series smoothing (rolling mean & LOWESS)
+    - Structural break detection (PELT algorithm)
+    - Hypothesis testing (before/after key events)
+    - Robustness checks (median, weighted, filtered variants)
+    - Comprehensive diagnostics summary table
 
 **Technologies**: 
 - `transformers` (Hugging Face), `torch` (PyTorch)
 - `pandas`, `numpy`, `matplotlib`
 - `newspaper3k`, `requests`
 - `yfinance` (for price data)
+- `statsmodels` (LOWESS smoothing, Granger causality)
+- `ruptures` (structural break detection)
+- `scipy` (statistical tests)
 
 **Pipeline Features**:
 - Resume capability for interrupted runs
@@ -112,8 +125,9 @@ This repository showcases practical applications of quantitative finance techniq
 ### Quantitative Finance
 - **Risk Metrics**: Value at Risk (VaR) calculations
 - **Fixed Income**: Yield curve modeling, duration analysis, portfolio risk
-- **Statistical Methods**: PCA, distribution fitting, Monte Carlo simulation
-- **Time Series Analysis**: Resampling, aggregation, correlation analysis
+- **Statistical Methods**: PCA, distribution fitting, Monte Carlo simulation, bootstrap CIs
+- **Time Series Analysis**: Resampling, aggregation, correlation analysis, structural break detection
+- **Causal Inference**: Granger causality testing
 
 ### Machine Learning & NLP
 - **Transformer Models**: FinBERT for financial sentiment analysis
@@ -154,6 +168,7 @@ pip install fredapi yfinance
 pip install transformers torch
 pip install newspaper3k requests
 pip install nelson-siegel-svensson
+pip install statsmodels ruptures  # For statistical enhancements (optional but recommended)
 ```
 
 ### API Keys Required
@@ -182,4 +197,4 @@ For questions or collaboration opportunities, please reach out through GitHub.
 
 ---
 
-**Last Updated**: January 2025
+**Last Updated**: January 2026
