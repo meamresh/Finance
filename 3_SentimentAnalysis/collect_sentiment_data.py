@@ -1,47 +1,55 @@
+#!/usr/bin/env python3
+"""
+Sentiment Data Collection Pipeline
+
+This script collects news articles from GDELT, extracts text, and analyzes sentiment
+using FinBERT. The results are saved to a parquet file for analysis.
+
+Usage:
+    python collect_sentiment_data.py [--query QUERY] [--years-back YEARS] [--articles-per-week N]
+"""
+
 import os
 import time
-import math
 import json
 import logging
+import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict
 import torch.nn.functional as F
 import requests
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from newspaper import Article, Config
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-QUERY = "Microsoft"
-YEARS_BACK = 2
+
+# Default configuration (can be overridden via command line)
+DEFAULT_QUERY = "Bitcoin"
+DEFAULT_YEARS_BACK = 2
+DEFAULT_ARTICLES_PER_WEEK = 10
+DEFAULT_RANDOM_STATE = 42
+
 GDELT_BASE = "https://api.gdeltproject.org/api/v2/doc/doc"
-OUT_PARQUET = f"gdelt_{QUERY}_2yrs_finbert.parquet"
-OUT_WEEKLY_PNG = f"gdelt_{QUERY}_2yrs_weekly_sentiment.png"
 MODEL_NAME = "yiyanghkust/finbert-tone"
 MAX_PER_CALL = 250
-PAUSE_BETWEEN_CALLS = 5  # FIXED: GDELT requires 5 seconds minimum
+PAUSE_BETWEEN_CALLS = 5  # GDELT requires 5 seconds minimum
 PAUSE_BETWEEN_DOWNLOADS = 0.5
 MAX_ARTICLE_CHUNKS = 6
 CHUNK_CHARS = 1000
-END_DATE = datetime.utcnow()
-START_DATE = END_DATE - timedelta(days=365 * YEARS_BACK)
-TEMP_META = 'gdelt_query_urls.jsonl'
-RANDOM_STATE = 42
-ARTICLES_PER_WEEK = 15
-
-print('Config set. Query:', QUERY)
 
 # ============================================================================
-# GDELT QUERY FUNCTIONS
+# GDELT QUERYING FUNCTIONS
 # ============================================================================
+
 def gdelt_datefmt(dt: datetime) -> str:
     """Convert datetime to GDELT format."""
     return dt.strftime('%Y%m%d%H%M%S')
@@ -69,7 +77,7 @@ def query_gdelt(query: str, start_dt: datetime, end_dt: datetime, maxrecords: in
         return None
 
 
-def query_gdelt_with_retry(query: str, start_dt: datetime, end_dt: datetime, 
+def query_gdelt_with_retry(query: str, start_dt: datetime, end_dt: datetime,
                            maxrecords: int = MAX_PER_CALL, max_retries: int = 3):
     """Query GDELT with retry logic."""
     for attempt in range(max_retries):
@@ -96,7 +104,7 @@ def iterate_month_windows(start: datetime, end: datetime):
         cur = nxt
 
 
-def fetch_all_gdelt_urls(query: str, start: datetime, end: datetime, out_meta_file: str = TEMP_META):
+def fetch_all_gdelt_urls(query: str, start: datetime, end: datetime, out_meta_file: str):
     """Query GDELT month-by-month and write metadata as JSONL for resume capability."""
     seen_urls = set()
 
@@ -152,10 +160,10 @@ def load_urls_from_meta(meta_file: str):
                 continue
     return rows
 
+# ============================================================================
+# TEXT EXTRACTION FUNCTIONS
+# ============================================================================
 
-# ============================================================================
-# TEXT EXTRACTION
-# ============================================================================
 def extract_text_with_newspaper(url: str, fallback_text: str = ""):
     """Extract article text using newspaper3k with proper timeout configuration."""
     try:
@@ -200,40 +208,52 @@ def chunk_text(text: str, max_chars=CHUNK_CHARS):
 
     return chunks
 
+# ============================================================================
+# PARQUET UTILITIES
+# ============================================================================
 
-# ============================================================================
-# PARQUET SANITIZATION
-# ============================================================================
-def sanitize_df_for_parquet(df: pd.DataFrame, convert_period_to='timestamp') -> pd.DataFrame:
-    """
-    Convert problematic pandas dtypes (Period, mixed objects) to parquet-safe types.
-    Returns a sanitized copy.
-    """
+def safe_to_parquet(df, path, **kwargs):
+    """Safely save to parquet with ArrowKeyError handling."""
+    import warnings
+    try:
+        df.to_parquet(path, engine='pyarrow', **kwargs)
+    except Exception as e:
+        if "pandas.period" in str(e) or "ArrowKeyError" in str(e):
+            logging.warning("Using fastparquet due to period type conflict")
+            try:
+                df.to_parquet(path, engine='fastparquet', **kwargs)
+            except ImportError:
+                logging.error("fastparquet not installed. Run: pip install fastparquet")
+                raise
+        else:
+            raise
+
+
+def sanitize_df_for_parquet(df, convert_period_to='timestamp'):
+    """Enhanced version with warning suppression and Period detection."""
+    import warnings
     df = df.copy()
 
     # Handle PeriodIndex
     if isinstance(df.index, pd.PeriodIndex):
-        if convert_period_to == 'timestamp':
-            df.index = df.index.to_timestamp()
-        else:
-            df.index = df.index.astype(str)
+        df.index = df.index.to_timestamp() if convert_period_to == 'timestamp' else df.index.astype(str)
 
-    # Column-wise sanitization
     for col in df.columns:
         col_dtype = df[col].dtype
         col_lower = col.lower()
 
-        # Date/time columns: try to parse to timestamps
+        # Date/time columns with warning suppression
         if any(token in col_lower for token in ("date", "time", "published")):
             try:
-                parsed = pd.to_datetime(df[col], errors='coerce', utc=True)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='Could not infer format')
+                    parsed = pd.to_datetime(df[col], errors='coerce', utc=True)
                 if parsed.notna().any():
                     df[col] = parsed
-                    continue
                 else:
                     df[col] = df[col].astype(str)
-                    continue
-            except Exception:
+                continue
+            except:
                 df[col] = df[col].astype(str)
                 continue
 
@@ -241,47 +261,46 @@ def sanitize_df_for_parquet(df: pd.DataFrame, convert_period_to='timestamp') -> 
         try:
             from pandas import PeriodDtype
             if isinstance(col_dtype, PeriodDtype):
-                if convert_period_to == 'timestamp':
-                    try:
-                        df[col] = df[col].dt.to_timestamp()
-                    except Exception:
-                        df[col] = df[col].astype(str)
-                else:
-                    df[col] = df[col].astype(str)
+                df[col] = df[col].dt.to_timestamp() if convert_period_to == 'timestamp' else df[col].astype(str)
                 continue
-        except Exception:
+        except:
             pass
 
-        # Handle object columns with Period objects
+        # Handle object columns
         if col_dtype == object:
             sample = df[col].dropna().head(50)
-            if not sample.empty and all(isinstance(x, pd.Period) for x in sample):
-                if convert_period_to == 'timestamp':
-                    df[col] = df[col].apply(lambda p: p.to_timestamp() if isinstance(p, pd.Period) else p)
-                else:
-                    df[col] = df[col].astype(str)
+
+            # Check for Period objects
+            if not sample.empty and any(isinstance(x, pd.Period) for x in sample):
+                df[col] = df[col].apply(
+                    lambda p: p.to_timestamp() if isinstance(p, pd.Period) else p
+                ) if convert_period_to == 'timestamp' else df[col].astype(str)
                 continue
 
-            # Auto-detect datetime strings
+            # Auto-detect datetime strings with warning suppression
             str_sample = sample.astype(str).str.strip().head(20)
             if len(str_sample) > 0:
-                parsed_sample = pd.to_datetime(str_sample, errors='coerce', utc=True)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='Could not infer format')
+                    parsed_sample = pd.to_datetime(str_sample, errors='coerce', utc=True)
+
                 if parsed_sample.notna().sum() / max(1, len(str_sample)) > 0.4:
                     try:
-                        df[col] = pd.to_datetime(df[col], errors='coerce', utc=True)
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', message='Could not infer format')
+                            df[col] = pd.to_datetime(df[col], errors='coerce', utc=True)
                         continue
-                    except Exception:
+                    except:
                         pass
 
-            # Default: convert to string for safety
             df[col] = df[col].astype(str)
 
     return df
 
+# ============================================================================
+# SENTIMENT ANALYSIS FUNCTIONS
+# ============================================================================
 
-# ============================================================================
-# FINBERT SENTIMENT ANALYSIS
-# ============================================================================
 def load_finbert_model(model_name: str = MODEL_NAME):
     """Load FinBERT tokenizer and model."""
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -363,81 +382,109 @@ def predict_article_sentiment(tokenizer, model, device, title, text,
 
     return {"avg_probs": avg_probs, "final_label": final_label, "n_pieces": len(all_probs)}
 
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-if __name__ == "__main__":
-    # Step 1: Fetch GDELT URLs
+def main(query: str, years_back: int, articles_per_week: int, random_state: int, output_dir: str = "."):
+    """Main pipeline to collect and analyze sentiment data."""
+    
+    # Setup paths
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=365 * years_back)
+    out_parquet = os.path.join(output_dir, f"gdelt_{query}_2yrs_finbert.parquet")
+    temp_meta = os.path.join(output_dir, f'gdelt_query_urls_{query}.jsonl')
+    
+    logging.info("=" * 60)
+    logging.info("SENTIMENT DATA COLLECTION PIPELINE")
+    logging.info("=" * 60)
+    logging.info(f"Query: {query}")
+    logging.info(f"Date range: {start_date.date()} to {end_date.date()}")
+    logging.info(f"Articles per week: {articles_per_week}")
+    logging.info(f"Output file: {out_parquet}")
+    
+    # === STEP 1: Fetch GDELT article URLs ===
     logging.info("=" * 60)
     logging.info("STEP 1: Fetching GDELT article URLs")
     logging.info("=" * 60)
-    meta_file = fetch_all_gdelt_urls(QUERY, START_DATE, END_DATE, TEMP_META)
-    print(f'Meta saved to {meta_file}')
-
-    # Step 2: Load and sample metadata
+    
+    meta_file = fetch_all_gdelt_urls(query, start_date, end_date, temp_meta)
+    logging.info(f'Meta saved to {meta_file}')
+    
+    # === STEP 2: Load and sample metadata ===
     logging.info("=" * 60)
     logging.info("STEP 2: Loading and sampling metadata")
     logging.info("=" * 60)
-    meta_rows = load_urls_from_meta(TEMP_META)
+    
+    meta_rows = load_urls_from_meta(temp_meta)
     meta_df = pd.DataFrame(meta_rows)
     meta_df['url'] = meta_df['url'].astype(str)
     meta_df.drop_duplicates(subset=['url'], inplace=True)
-    print(f'Total unique URLs: {len(meta_df)}')
-
-    # Parse dates and sample
+    logging.info(f'Total unique URLs: {len(meta_df)}')
+    
+    # Parse seendate and drop invalid entries
     meta_df['seendate_parsed'] = pd.to_datetime(meta_df['seendate'], errors='coerce', utc=True)
     meta_df = meta_df.dropna(subset=['seendate_parsed'])
-
-    # FIXED: Use to_timestamp() to avoid PeriodIndex issues
+    
+    # Use to_timestamp() to avoid PeriodIndex issues
     meta_df['week'] = meta_df['seendate_parsed'].dt.to_period('W-MON').dt.to_timestamp()
-
+    
     # Sample articles per week
     sampled_df = meta_df.groupby('week').apply(
-        lambda g: g.sample(n=min(len(g), ARTICLES_PER_WEEK), random_state=RANDOM_STATE)
+        lambda g: g.sample(n=min(len(g), articles_per_week), random_state=random_state)
     ).reset_index(drop=True)
-
-    print(f"Selected {len(sampled_df)} articles ({sampled_df['week'].nunique()} weeks)")
+    
+    logging.info(f"Selected {len(sampled_df)} articles ({sampled_df['week'].nunique()} weeks)")
     meta_df = sampled_df
-
-    # Step 3: Extract text and run FinBERT
+    
+    # === STEP 3: Extract text and run FinBERT ===
     logging.info("=" * 60)
     logging.info("STEP 3: Extracting text and analyzing sentiment")
     logging.info("=" * 60)
-
+    
     # Load existing results for resume
     done_df = pd.DataFrame()
-    if os.path.exists(OUT_PARQUET):
-        logging.info(f'Loading existing parquet {OUT_PARQUET} for resume')
-        done_df = pd.read_parquet(OUT_PARQUET)
-
-    # FIXED: Use set for O(1) lookup instead of O(n)
+    if os.path.exists(out_parquet):
+        logging.info(f'Loading existing parquet {out_parquet} for resume')
+        done_df = pd.read_parquet(out_parquet)
+    
+    # Prepare set of processed URLs for quick lookup
     processed_urls = set(done_df['url'].values) if not done_df.empty else set()
-
+    
     # Load FinBERT model
     tokenizer, model, device = load_finbert_model(MODEL_NAME)
-
+    
+    # Track statistics
+    stats = {
+        "total_meta": len(meta_df),
+        "no_content": 0,
+        "sent_fail": 0,
+        "ok": 0,
+    }
+    
     new_rows = []
-
+    
     for idx, r in tqdm(meta_df.iterrows(), total=len(meta_df), desc='Processing articles'):
         url = r['url']
-
-        # FIXED: O(1) lookup
+        
+        # Skip if already processed
         if url in processed_urls:
             continue
-
+        
         title_meta = r.get('title') or ''
         title, text, pubdate = extract_text_with_newspaper(url, fallback_text=title_meta)
         time.sleep(PAUSE_BETWEEN_DOWNLOADS)
-
+        
         if not title and not text:
-            logging.info(f'No content for url {url} (skipping)')
+            logging.debug(f'No content for url {url} (skipping)')
+            stats["no_content"] += 1
             continue
-
+        
         pred = predict_article_sentiment(tokenizer, model, device, title or title_meta, text or '')
         if pred is None:
+            stats["sent_fail"] += 1
             continue
-
+        
         avg_probs = pred['avg_probs']
         rec = {
             'url': url,
@@ -451,67 +498,55 @@ if __name__ == "__main__":
             'n_pieces': pred['n_pieces']
         }
         new_rows.append(rec)
-        processed_urls.add(url)  # FIXED: Add to set
-
+        processed_urls.add(url)
+        stats["ok"] += 1
+        
         # Save every 50 articles
         if len(new_rows) >= 50:
             logging.info(f'Checkpoint: Saving {len(new_rows)} new rows ({len(done_df) + len(new_rows)} total)')
             chunk_df = pd.DataFrame(new_rows)
             done_df = pd.concat([done_df, chunk_df], ignore_index=True) if not done_df.empty else chunk_df.copy()
             safe_df = sanitize_df_for_parquet(done_df, convert_period_to='timestamp')
-            safe_df.to_parquet(OUT_PARQUET, index=False)
+            safe_to_parquet(safe_df, out_parquet, index=False)
             new_rows = []
-
+    
     # Final save
     if new_rows:
         logging.info(f'Final save: {len(new_rows)} new rows')
         chunk_df = pd.DataFrame(new_rows)
         done_df = pd.concat([done_df, chunk_df], ignore_index=True) if not done_df.empty else chunk_df.copy()
         safe_df = sanitize_df_for_parquet(done_df, convert_period_to='timestamp')
-        safe_df.to_parquet(OUT_PARQUET, index=False)
-
+        safe_to_parquet(safe_df, out_parquet, index=False)
+    
     logging.info(f'Finished extraction & prediction; total articles: {len(done_df)}')
-
-    # Step 4: Generate weekly sentiment plot
+    
+    # Print statistics
     logging.info("=" * 60)
-    logging.info("STEP 4: Generating weekly sentiment plot")
+    logging.info("COLLECTION STATISTICS")
     logging.info("=" * 60)
+    logging.info(f"Total URLs sampled: {stats['total_meta']}")
+    logging.info(f"Successfully processed: {stats['ok']} ({stats['ok']/stats['total_meta']*100:.1f}%)")
+    logging.info(f"No content extracted: {stats['no_content']} ({stats['no_content']/stats['total_meta']*100:.1f}%)")
+    logging.info(f"Sentiment analysis failed: {stats['sent_fail']} ({stats['sent_fail']/stats['total_meta']*100:.1f}%)")
+    logging.info(f"Output saved to: {out_parquet}")
+    
+    return out_parquet
 
-    if 'done_df' not in locals() or done_df.empty:
-        if os.path.exists(OUT_PARQUET):
-            done_df = pd.read_parquet(OUT_PARQUET)
-        else:
-            raise FileNotFoundError('No prediction parquet found')
 
-    # FIXED: Use copy to avoid modifying original DataFrame
-    plot_df = done_df.copy()
-    plot_df['published'] = pd.to_datetime(plot_df['published_raw'], errors='coerce', utc=True)
-    plot_df['published'] = plot_df['published'].fillna(pd.Timestamp.utcnow())
-    plot_df.set_index('published', inplace=True)
-
-    # FIXED: Convert PeriodIndex to TimestampIndex after resample
-    weekly = plot_df[['prob_positive','prob_neutral','prob_negative']].resample('W-MON').mean().sort_index()
-    if isinstance(weekly.index, pd.PeriodIndex):
-        weekly.index = weekly.index.to_timestamp()
-
-    # Generate plot
-    plt.figure(figsize=(12,5))
-    plt.plot(weekly.index, weekly['prob_positive'], label='Positive', linewidth=2, marker='o')
-    plt.plot(weekly.index, weekly['prob_neutral'], label='Neutral', linewidth=2, marker='s')
-    plt.plot(weekly.index, weekly['prob_negative'], label='Negative', linewidth=2, marker='^')
-    plt.xlabel('Week', fontsize=12)
-    plt.ylabel('Average sentiment probability', fontsize=12)
-    plt.title(f"Weekly-averaged FinBERT sentiment for '{QUERY}' ({START_DATE.date()} → {END_DATE.date()})", fontsize=14)
-    plt.legend(fontsize=10)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    plt.savefig(OUT_WEEKLY_PNG, dpi=150)
-    logging.info(f'Saved weekly plot to {OUT_WEEKLY_PNG}')
-    plt.show()
-
-    print("\n" + "=" * 60)
-    print("PROCESSING COMPLETE!")
-    print("=" * 60)
-    print(f"Total articles processed: {len(done_df)}")
-    print(f"Output parquet: {OUT_PARQUET}")
-    print(f"Output plot: {OUT_WEEKLY_PNG}")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Collect sentiment data from GDELT news articles")
+    parser.add_argument("--query", type=str, default=DEFAULT_QUERY, help="Search query (default: Bitcoin)")
+    parser.add_argument("--years-back", type=int, default=DEFAULT_YEARS_BACK, help="Years of historical data (default: 2)")
+    parser.add_argument("--articles-per-week", type=int, default=DEFAULT_ARTICLES_PER_WEEK, help="Articles to sample per week (default: 10)")
+    parser.add_argument("--random-state", type=int, default=DEFAULT_RANDOM_STATE, help="Random seed for sampling (default: 42)")
+    parser.add_argument("--output-dir", type=str, default=".", help="Output directory for parquet file (default: current directory)")
+    
+    args = parser.parse_args()
+    
+    main(
+        query=args.query,
+        years_back=args.years_back,
+        articles_per_week=args.articles_per_week,
+        random_state=args.random_state,
+        output_dir=args.output_dir
+    )
